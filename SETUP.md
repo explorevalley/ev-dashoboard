@@ -1,140 +1,175 @@
-# Setting this up on another machine
+# Setting up the ExploreValley Admin dashboard
 
-The `ev-admin` folder is self-contained. Everything it needs is here except
-`node_modules`, which is installed in step 2.
+Two things are needed and they arrive separately:
+
+1. **The code** — cloned from GitHub (these instructions).
+2. **The settings file, `.llo`** — sent to you directly. It is deliberately not
+   in the repository, because it holds live credentials.
+
+Without the `.llo` the server will not start. If you have not been given one,
+ask before going further.
 
 ---
 
-## 1. Install Node.js
+## 1. Install Node.js and Git
 
-Node **18 or newer**. Download the LTS build from <https://nodejs.org/> and
-install it with the defaults.
+- **Node.js 18 or newer** — the LTS build from <https://nodejs.org/>, defaults are fine.
+- **Git** — <https://git-scm.com/downloads>.
 
-Check it worked — open a new terminal (a new one; the installer only updates
-PATH for terminals opened afterwards) and run:
+Then open a **new** terminal (a new one — installers only update PATH for
+terminals opened afterwards) and check both:
 
 ```
 node --version
+git --version
 ```
 
-You should see `v18.x` or higher. If the command is not recognised, Node is not
-on PATH — reinstall and make sure "Add to PATH" is ticked.
+---
+
+## 2. Clone the repository
+
+```bash
+git clone https://github.com/explorevalley/ev-dashoboard.git ev-admin
+cd ev-admin
+```
+
+Put it somewhere plain like `C:\ev-admin`. Avoid OneDrive, Dropbox or any
+synced folder — `node_modules` is ~150 MB of small files and sync clients
+struggle with it.
 
 ---
 
-## 2. Put the folder somewhere sensible
+## 3. Add your `.llo` settings file
 
-Unzip `ev-admin-portable.zip`. You get a single `ev-admin` folder — move it
-wherever you want it to live, for example `C:\ev-admin` or `D:\apps\ev-admin`.
+Copy the `.llo` you were given into the root of the folder, next to
+`package.json`:
 
-Avoid OneDrive, Dropbox or any synced folder. `node_modules` is ~150 MB of
-small files and sync clients choke on it.
+```
+ev-admin/
+  .llo              <-- here
+  package.json
+  start-admin.bat
+  ...
+```
+
+`.llo` is excluded from the repository, so it is never overwritten by an
+update and never uploaded by accident.
 
 ---
 
-## 3. Start it
+## 4. Start it
 
 **Windows** — double-click **`start-admin.bat`**.
 
-The first run installs dependencies, which takes a few minutes and needs an
-internet connection. It will look like it has frozen; it has not. Every run
-after this one starts in a couple of seconds.
+The first run installs dependencies. That takes a few minutes and needs an
+internet connection; it will look like it has stalled, but it has not. Later
+runs start in seconds.
 
-**macOS or Linux** — there is no launcher, so run it by hand:
+**macOS / Linux**
 
 ```bash
-cd ev-admin
 npm install
 npm start
 ```
 
 ---
 
-## 4. Open the dashboard
+## 5. Open the dashboard
 
-`start-admin.bat` prints the URLs and opens the browser for you. If you started
-it by hand, the server prints them too. Do not guess them — the port and paths
-come from the `.llo` settings file and are not the defaults.
+The launcher prints the URLs and opens your browser. If you started it by hand,
+the server prints them too.
 
-There are five separate dashboards; the page renders differently depending on
-which URL served it.
+**Do not guess the address.** The port and paths come from the `.llo` and are
+not the obvious defaults. There are five separate dashboards; the page renders
+differently depending on which one served it.
 
-Sign in with an account from the `ev_dashboard_credentials` table in Supabase.
-An account only reaches the dashboards its `scope` column lists.
+Sign in with the username and password you were given. Your account only
+reaches the dashboards it has been granted.
 
 ---
 
-## 5. Check it is actually working
+## 6. Check it is really working
 
-Two things prove the whole chain is up:
-
-- The startup output says `settings loaded from .llo`. If it says `.env`
-  instead, the `.llo` file did not come across.
-- Visit `/healthz` on the port it printed. You should get
+- Startup should say `settings loaded from .llo`. If it says `.env` instead,
+  the `.llo` is not in the right place.
+- Visiting `/healthz` on the port it printed should return
   `{"ok":true,"service":"ev-admin"}`.
 
-If a dashboard loads but every list is empty, the server is running but cannot
-reach Supabase — check the machine's internet access first.
+If the dashboard loads but every list is empty, the server is running and
+cannot reach Supabase — check that machine's internet connection.
 
 ---
 
-## Settings
+## Getting later updates
 
-All configuration lives in **`.llo`**, which came with the folder. It is
-base32-encoded, so it is not directly editable. To change something:
-
-```bash
-npm run env:decode     # .llo -> .env
-#   ... edit .env in any text editor ...
-npm run env:encode     # .env -> .llo
-del .env               # (rm .env on macOS/Linux)
-npm run env:check      # confirm it parses
+```
+update.bat            (Windows)
+./update.sh           (macOS / Linux)
 ```
 
-`env:encode` refuses to write a `.llo` that does not decode back to exactly
-what it read, so a bad edit cannot silently destroy your settings.
+That fetches the latest code and reinstalls dependencies only if they actually
+changed. Your `.llo` is never touched.
 
-The two you are most likely to want:
+If it reports that it cannot fast-forward, something in your copy has been
+edited. To discard those edits and match GitHub exactly:
 
-- `PORT` — change it if something else on the machine already uses that port.
-- `ADMIN_UI_PATH` — the long unguessable path the dashboard is served at.
+```
+update.bat --reset
+./update.sh --reset
+```
+
+Your settings survive that — `.llo` is not part of the repository.
+
+`update.bat --status` shows what version you are on without changing anything.
+
+---
+
+## This is a read-only copy
+
+You can pull updates; you are not expected to push changes back. The update
+scripts point the push address at a dead URL so an accidental `git push` fails
+rather than doing something unexpected.
+
+If you have a change that should go in, send it to the maintainer rather than
+pushing.
+
+---
+
+## Please read before putting this on a network
+
+- **There is no IP allowlist and no SSO.** The unguessable URL and the login
+  are the only things in front of it.
+- **It listens on every network interface by default**, so anyone who can reach
+  the machine can reach the login page. To restrict it to your machine only,
+  ask for `HOST=127.0.0.1` to be set in your `.llo`.
+- **`.llo` holds a Supabase service-role key**, which bypasses database
+  row-level security. It is base32-encoded, and encoding is *not* encryption —
+  one command decodes it. Anyone who can read the file can read and write every
+  row in the database. Keep it off shared machines, do not email it around, and
+  never commit it.
 
 ---
 
 ## Troubleshooting
 
 **"Node.js is not installed, or not on PATH"**
-Node is missing, or you are in a terminal opened before installing it. Open a
-new terminal and try again.
+Node is missing, or you are in a terminal that was open before you installed
+it. Open a new terminal.
+
+**Server exits saying settings are missing**
+The `.llo` is not in the folder root, or is the wrong file. It sits next to
+`package.json`.
 
 **`npm install` fails**
-Usually no internet, or a proxy. If it fails on a native module, run
-`start-admin.bat --install` to retry from clean. On Windows the image library
-ships a prebuilt binary, so build tools are normally not needed.
+Usually no internet or a proxy. Retry with `start-admin.bat --install`.
 
-**"Port already in use" / server exits immediately**
-Something else holds the port. Change `PORT` in the settings (see above), or
-stop the other process.
+**"Port already in use"**
+Something else on the machine holds that port. Ask for a different `PORT` in
+your `.llo`.
 
-**Page loads but has no styling, console shows MIME type errors**
-You are running an old `dist/server.js`. Run `npm run build` and restart.
+**Page loads with no styling, console shows MIME type errors**
+You are running a stale build. Run `npm run build`, then restart.
 
-**Dashboard 404s**
-Wrong URL. Use the ones the launcher printed, exactly — the paths are long and
-differ from each other by a few characters in the middle.
-
----
-
-## Before you put this on a network
-
-Read the "Notes and limits" section of `README.md`. The short version:
-
-- There is no IP allowlist and no SSO in front of this. The unguessable URL and
-  the login are the only things protecting it.
-- The server listens on **all network interfaces** by default, so anyone who
-  can reach the machine can reach the dashboard. Set `HOST=127.0.0.1` to
-  restrict it to that machine only.
-- `.llo` contains a Supabase **service-role key**, which bypasses row-level
-  security. Base32 is an encoding, not encryption — `npm run env:decode` is all
-  anyone needs. Whoever can read the folder can read and write every row in the
-  project. Keep it off shared machines, and never commit it.
+**A dashboard URL returns 404**
+Wrong address. Use exactly what the launcher printed — the paths are long and
+differ from one another by only a few characters.
