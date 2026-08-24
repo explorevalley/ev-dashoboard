@@ -13,6 +13,7 @@ rem  Flags:
 rem    --install      reinstall dependencies even if node_modules is present
 rem    --build        rebuild the UI and server bundle before starting
 rem    --no-browser   start the server but do not open a browser
+rem    --init         create a blank .env to fill in (new deployments only)
 rem    --help         show this list
 rem
 rem  Press Ctrl+C in this window to stop the server.
@@ -28,12 +29,14 @@ if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 set "DO_INSTALL="
 set "DO_BUILD="
 set "OPEN_BROWSER=1"
+set "DO_INIT="
 
 :parse_args
 if "%~1"=="" goto args_done
 if /I "%~1"=="--install"    set "DO_INSTALL=1"
 if /I "%~1"=="--build"      set "DO_BUILD=1"
 if /I "%~1"=="--no-browser" set "OPEN_BROWSER="
+if /I "%~1"=="--init"       set "DO_INIT=1"
 if /I "%~1"=="--help"       goto usage
 if /I "%~1"=="-h"           goto usage
 if /I "%~1"=="/?"           goto usage
@@ -53,6 +56,8 @@ if errorlevel 1 (
   echo      %ROOT%
   goto fail
 )
+
+if defined DO_INIT goto init_settings
 
 rem --- Node -----------------------------------------------------------------
 where node >nul 2>&1
@@ -81,8 +86,9 @@ if errorlevel 1 (
 )
 
 rem --- Settings: .llo -------------------------------------------------------
-rem Settings live in .llo - base32-encoded key=value pairs, not plain .env.
-rem scripts/env-llo.cjs owns that format; this only branches on its exit code:
+rem Settings live in .llo - base32-encoded key=value pairs. The server decodes
+rem it directly at boot; nothing here needs a .env. scripts/env-llo.cjs owns
+rem the format, and this only branches on its exit code:
 rem   0 usable, 1 no .llo at all, 2 .llo present but incomplete.
 
 if not exist ".llo" (
@@ -93,27 +99,20 @@ if not exist ".llo" (
     if errorlevel 1 goto fail
     echo.
   ) else (
-    if not exist ".env.example" (
-      echo  [x] No .llo, no .env and no .env.example. This folder looks incomplete.
-      goto fail
-    )
-    copy /y ".env.example" ".env" >nul
+    rem A fresh clone lands here. .llo is deliberately not in the repository,
+    rem so the answer is "put yours here", not "fill in a blank .env" - that
+    rem only applies to someone standing up a brand new deployment.
     echo.
-    echo  [warn] No settings found, so .env was created from .env.example.
+    echo  [x] No settings file ^(.llo^) in this folder.
     echo.
-    echo      Fill in these four values:
+    echo      Copy the .llo you were given into:
+    echo        %ROOT%
     echo.
-    echo        SUPABASE_URL
-    echo        SUPABASE_SERVICE_ROLE_KEY    the service-role key, not the anon key
-    echo        JWT_SECRET                   any long random string
-    echo        ADMIN_ALLOWED_EMAIL
+    echo      It sits next to package.json. Then run this script again -
+    echo      everything else is read straight out of it, and no .env is needed.
     echo.
-    echo      Then run this script again. It will encode .env into .llo for you,
-    echo      and you can delete the plain .env afterwards.
-    echo.
-    echo      Opening .env in Notepad now.
-    echo.
-    start "" notepad ".env"
+    echo      Setting up a brand new deployment with no .llo to copy?
+    echo        start-admin.bat --init
     goto fail_quiet
   )
 )
@@ -130,7 +129,7 @@ if errorlevel 1 (
   goto fail_quiet
 )
 
-echo  [ok] settings present in .llo
+echo  [ok] settings loaded from .llo
 
 rem --- Dependencies ---------------------------------------------------------
 if defined DO_INSTALL (
@@ -261,6 +260,36 @@ echo      Studio Build Tools usually fixes it. Otherwise try deleting
 echo      node_modules and running this script again with --install.
 goto fail
 
+:init_settings
+if exist ".llo" (
+  echo  [x] A .llo already exists here. Nothing to initialise.
+  echo      To change it:  npm run env:decode, edit .env, npm run env:encode
+  goto fail_quiet
+)
+if not exist ".env.example" (
+  echo  [x] .env.example is missing, so there is no template to start from.
+  goto fail_quiet
+)
+if exist ".env" (
+  echo  [warn] .env already exists - leaving it alone and opening it.
+) else (
+  copy /y ".env.example" ".env" >nul
+  echo  [ok] .env created from .env.example
+)
+echo.
+echo      Fill in these four values:
+echo.
+echo        SUPABASE_URL
+echo        SUPABASE_SERVICE_ROLE_KEY    the service-role key, not the anon key
+echo        JWT_SECRET                   any long random string
+echo        ADMIN_ALLOWED_EMAIL
+echo.
+echo      Then run start-admin.bat again. It encodes .env into .llo, after
+echo      which you should delete the plain .env.
+echo.
+start "" notepad ".env"
+goto fail_quiet
+
 :usage
 echo.
 echo  ExploreValley Admin - launcher
@@ -269,6 +298,7 @@ echo    start-admin.bat                 install if needed, then start
 echo    start-admin.bat --install       reinstall dependencies first
 echo    start-admin.bat --build         rebuild UI and server bundle first
 echo    start-admin.bat --no-browser    start without opening a browser
+echo    start-admin.bat --init          create a blank .env to fill in
 echo    start-admin.bat --help          this list
 echo.
 exit /b 0
