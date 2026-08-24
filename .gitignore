@@ -1,0 +1,28 @@
+# Dependencies - reinstalled from package-lock.json
+node_modules/
+
+# Secrets. Never commit these.
+#   .env  - plain text settings
+#   .llo  - the same settings, base32 encoded. Encoding is NOT encryption:
+#           anyone with the file runs `npm run env:decode` and has your
+#           Supabase service-role key. Treat it exactly like .env.
+.env
+.env.*
+!.env.example
+.llo
+*.llo
+*.pem
+*.key
+*.p12
+*.keystore
+
+# Generated at runtime
+runtime/
+data/
+dist/meta.json
+
+# Build and packaging artefacts
+*.zip
+*.log
+.DS_Store
+Thumbs.db
