@@ -34439,6 +34439,11 @@ ${target}`);
         bookingMode: normalizeStatus(pick(row, "booking_mode", "bookingMode")) || "union",
         quotedFare: safeNumber(pick(row, "quoted_fare", "quotedFare")),
         quoteStatus: normalizeStatus(pick(row, "quote_status", "quoteStatus")),
+        // Set only once a driver is actually on the ride. A quoted ride never
+        // gets one on its own: the bid flow assigns a driver as a side effect
+        // of the customer accepting a bid, and a desk-priced ride has no bid.
+        assignedDriverId: safeText2(pick(row, "assigned_driver_id", "assignedDriverId")),
+        rideOtp: safeText2(pick(row, "ride_otp", "rideOtp")),
         refunds,
         queries,
         rating: safeNumber(review == null ? void 0 : review.rating),
@@ -34586,7 +34591,30 @@ ${target}`);
     const [detailKey, setDetailKey] = (0, import_react5.useState)("");
     const [queryKey, setQueryKey] = (0, import_react5.useState)("");
     const [quoteKey, setQuoteKey] = (0, import_react5.useState)("");
+    const [dispatchKey, setDispatchKey] = (0, import_react5.useState)("");
     const orders = (0, import_react5.useMemo)(() => buildOrders(tablesByName), [tablesByName]);
+    const drivers = (0, import_react5.useMemo)(() => {
+      const rows = readTableRows(tablesByName, ["drivers", "ev_drivers"]);
+      const vehicles = readTableRows(tablesByName, ["driverVehicles", "ev_driver_vehicles"]);
+      const vehicleByDriver = /* @__PURE__ */ new Map();
+      vehicles.forEach((v) => {
+        const key = safeText2(pick(v, "driver_id", "driverId"));
+        if (key && !vehicleByDriver.has(key)) vehicleByDriver.set(key, v);
+      });
+      return rows.filter((d) => normalizeStatus(d == null ? void 0 : d.status) === "approved" && (d == null ? void 0 : d.active) !== false).map((d) => {
+        const vehicle = vehicleByDriver.get(safeText2(d == null ? void 0 : d.id)) || null;
+        return {
+          id: safeText2(d == null ? void 0 : d.id),
+          name: safeText2(d == null ? void 0 : d.name),
+          phone: safeText2(d == null ? void 0 : d.phone),
+          rating: safeNumber(d == null ? void 0 : d.rating),
+          vehicleType: safeText2(pick(vehicle || {}, "vehicle_type", "vehicleType")),
+          vehicleModel: safeText2(vehicle == null ? void 0 : vehicle.model),
+          vehicleNumber: safeText2(pick(vehicle || {}, "vehicle_number", "vehicleNumber"))
+        };
+      }).sort((a, b) => a.name.localeCompare(b.name));
+    }, [tablesByName]);
+    const driversById = (0, import_react5.useMemo)(() => new Map(drivers.map((d) => [d.id, d])), [drivers]);
     const services = (0, import_react5.useMemo)(
       () => Array.from(new Set(orders.map((order) => order.service))).sort(),
       [orders]
@@ -34612,6 +34640,10 @@ ${target}`);
       () => quoteKey ? orders.find((order) => `${order.source}-${order.id}` === quoteKey) || null : null,
       [orders, quoteKey]
     );
+    const dispatchOrder = (0, import_react5.useMemo)(
+      () => dispatchKey ? orders.find((order) => `${order.source}-${order.id}` === dispatchKey) || null : null,
+      [orders, dispatchKey]
+    );
     const sendQuote = async (order, fare) => {
       if (!(order == null ? void 0 : order.id)) return;
       setBusyId(order.id);
@@ -34622,6 +34654,23 @@ ${target}`);
           body: JSON.stringify({ fare })
         });
         setQuoteKey("");
+        await onReload();
+      } catch (err) {
+        setError(String((err == null ? void 0 : err.message) || err));
+      } finally {
+        setBusyId("");
+      }
+    };
+    const sendDispatch = async (order, payload) => {
+      if (!(order == null ? void 0 : order.id) || !payload) return;
+      setBusyId(order.id);
+      setError("");
+      try {
+        await http(`/api/admin/cab-bookings/${encodeURIComponent(order.id)}/dispatch`, {
+          method: "POST",
+          body: JSON.stringify(payload)
+        });
+        setDispatchKey("");
         await onReload();
       } catch (err) {
         setError(String((err == null ? void 0 : err.message) || err));
@@ -34684,80 +34733,94 @@ ${target}`);
         onChange: resetTo(setSearch),
         placeholder: "Search id, customer, phone, details"
       }
-    )), /* @__PURE__ */ import_react5.default.createElement("select", { className: "select", value: serviceFilter, onChange: resetTo(setServiceFilter) }, /* @__PURE__ */ import_react5.default.createElement("option", { value: "all" }, "All services"), services.map((service) => /* @__PURE__ */ import_react5.default.createElement("option", { key: service, value: service }, service))), /* @__PURE__ */ import_react5.default.createElement("select", { className: "select", value: statusFilter, onChange: resetTo(setStatusFilter) }, /* @__PURE__ */ import_react5.default.createElement("option", { value: "all" }, "All statuses"), STATUS_CHOICES.map((status) => /* @__PURE__ */ import_react5.default.createElement("option", { key: status, value: status }, status))))), error ? /* @__PURE__ */ import_react5.default.createElement("div", { className: "warn mt-10" }, error) : null, /* @__PURE__ */ import_react5.default.createElement("div", { className: "table-wrap mt-10" }, /* @__PURE__ */ import_react5.default.createElement("table", { className: "table orders-table" }, /* @__PURE__ */ import_react5.default.createElement("thead", null, /* @__PURE__ */ import_react5.default.createElement("tr", null, /* @__PURE__ */ import_react5.default.createElement("th", null, "Order"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Date"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Customer"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Service"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Details"), /* @__PURE__ */ import_react5.default.createElement("th", { className: "num" }, "Amount"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Payment"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Status"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Rating"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Fare Quote"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Refund"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Refund Status"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Support"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Invoice"))), /* @__PURE__ */ import_react5.default.createElement("tbody", null, pageRows.length ? pageRows.map((order) => /* @__PURE__ */ import_react5.default.createElement("tr", { key: `${order.source}-${order.id}` }, /* @__PURE__ */ import_react5.default.createElement("td", { className: "mono", title: order.id }, order.id.slice(0, 14)), /* @__PURE__ */ import_react5.default.createElement("td", null, /* @__PURE__ */ import_react5.default.createElement("div", null, formatDate(order.date)), hasLaterActivity(order) ? /* @__PURE__ */ import_react5.default.createElement("div", { className: "small muted", title: "Last refund or support activity" }, "upd ", formatDate(new Date(order.activityAt).toISOString())) : null), /* @__PURE__ */ import_react5.default.createElement("td", null, /* @__PURE__ */ import_react5.default.createElement("div", { className: "orders-customer" }, order.customer || "\u2014"), order.phone ? /* @__PURE__ */ import_react5.default.createElement("div", { className: "small muted" }, order.phone) : null), /* @__PURE__ */ import_react5.default.createElement("td", null, /* @__PURE__ */ import_react5.default.createElement("span", { className: `chip ${SERVICE_TONE[order.service] || ""}` }, order.service)), /* @__PURE__ */ import_react5.default.createElement("td", { className: "orders-detail", onClick: (event) => event.stopPropagation() }, /* @__PURE__ */ import_react5.default.createElement(
-      "button",
-      {
-        type: "button",
-        className: "btn small ghost orders-detail-btn",
-        title: order.detail || `Details for ${order.id}`,
-        onClick: () => setDetailKey(`${order.source}-${order.id}`)
-      },
-      /* @__PURE__ */ import_react5.default.createElement(FaInfoCircle, null),
-      " Details"
-    )), /* @__PURE__ */ import_react5.default.createElement("td", { className: "num" }, order.amount > 0 ? formatCurrency(order.amount) : "\u2014"), /* @__PURE__ */ import_react5.default.createElement("td", { className: "small" }, order.payment || "\u2014"), /* @__PURE__ */ import_react5.default.createElement("td", { onClick: (event) => event.stopPropagation() }, /* @__PURE__ */ import_react5.default.createElement(
-      "select",
-      {
-        className: `select status-select ${statusClass(order.status)}`,
-        value: order.status,
-        disabled: busyId === order.id,
-        onChange: (event) => changeStatus(order, event.target.value)
-      },
-      STATUS_CHOICES.includes(order.status) ? null : /* @__PURE__ */ import_react5.default.createElement("option", { value: order.status }, order.status),
-      STATUS_CHOICES.map((status) => /* @__PURE__ */ import_react5.default.createElement("option", { key: status, value: status }, status))
-    )), /* @__PURE__ */ import_react5.default.createElement("td", { className: "orders-rating" }, order.rating > 0 ? /* @__PURE__ */ import_react5.default.createElement(
-      "span",
-      {
-        className: `orders-stars ${order.rating <= 2 ? "is-low" : ""}`,
-        title: order.reviewText ? `${order.rating}/5 \u2014 "${order.reviewText}"` : `${order.rating}/5${order.ratedAt ? ` on ${formatDate(order.ratedAt)}` : ""}`
-      },
-      "\u2605".repeat(order.rating),
-      /* @__PURE__ */ import_react5.default.createElement("span", { className: "orders-stars-empty" }, "\u2605".repeat(5 - order.rating)),
-      order.reviewText ? /* @__PURE__ */ import_react5.default.createElement(FaCommentDots, { className: "orders-rating-note" }) : null
-    ) : /* @__PURE__ */ import_react5.default.createElement("span", { className: "small muted" }, "\u2014")), /* @__PURE__ */ import_react5.default.createElement("td", { className: "orders-detail", onClick: (event) => event.stopPropagation() }, order.bookingMode === "quotes" ? /* @__PURE__ */ import_react5.default.createElement(
-      "button",
-      {
-        type: "button",
-        className: `btn small ghost orders-detail-btn ${order.quoteStatus ? "" : "orders-quote-due"}`,
-        title: `Send a fare quote for ${order.id}`,
-        disabled: busyId === order.id,
-        onClick: () => setQuoteKey(`${order.source}-${order.id}`)
-      },
-      /* @__PURE__ */ import_react5.default.createElement(FaRupeeSign, null),
-      order.quoteStatus ? `${formatCurrency(order.quotedFare)} ${order.quoteStatus}` : "Send quote"
-    ) : /* @__PURE__ */ import_react5.default.createElement("span", { className: "small muted" }, "\u2014")), /* @__PURE__ */ import_react5.default.createElement("td", null, /* @__PURE__ */ import_react5.default.createElement("span", { className: `chip ${order.refundRequested ? "refund-yes" : "refund-no"}` }, order.refundRequested ? "Yes" : "No")), /* @__PURE__ */ import_react5.default.createElement("td", { onClick: (event) => event.stopPropagation() }, order.refundStatus ? /* @__PURE__ */ import_react5.default.createElement(
-      "select",
-      {
-        className: `select status-select refund-select ${statusClass(order.refundStatus)}`,
-        value: order.refundStatus,
-        disabled: busyId === order.id,
-        onChange: (event) => changeRefundStatus(order, event.target.value)
-      },
-      REFUND_STATUS_CHOICES.includes(order.refundStatus) ? null : /* @__PURE__ */ import_react5.default.createElement("option", { value: order.refundStatus }, order.refundStatus),
-      REFUND_STATUS_CHOICES.map((status) => /* @__PURE__ */ import_react5.default.createElement("option", { key: status, value: status }, status))
-    ) : /* @__PURE__ */ import_react5.default.createElement("span", { className: "small muted" }, "\u2014")), /* @__PURE__ */ import_react5.default.createElement("td", { className: "orders-detail", onClick: (event) => event.stopPropagation() }, order.queries.length ? /* @__PURE__ */ import_react5.default.createElement(
-      "button",
-      {
-        type: "button",
-        className: "btn small ghost orders-detail-btn",
-        title: `View ${order.queries.length} support message(s) for ${order.id}`,
-        onClick: () => setQueryKey(`${order.source}-${order.id}`)
-      },
-      /* @__PURE__ */ import_react5.default.createElement(FaCommentDots, null),
-      " ",
-      order.queries.length,
-      " message",
-      order.queries.length > 1 ? "s" : ""
-    ) : /* @__PURE__ */ import_react5.default.createElement("span", { className: "small muted" }, "\u2014")), /* @__PURE__ */ import_react5.default.createElement("td", { onClick: (event) => event.stopPropagation() }, /* @__PURE__ */ import_react5.default.createElement("div", { className: "orders-invoice-actions" }, order.cancelled || !INVOICE_TABLE_BY_SOURCE[order.source] ? /* @__PURE__ */ import_react5.default.createElement("span", { className: "small muted" }, "\u2014") : /* @__PURE__ */ import_react5.default.createElement(
-      "button",
-      {
-        type: "button",
-        className: "btn small ghost",
-        title: `View invoice for ${order.id}`,
-        onClick: () => openInvoice(order, false)
-      },
-      /* @__PURE__ */ import_react5.default.createElement(FaFileInvoice, null),
-      " View"
-    ))))) : /* @__PURE__ */ import_react5.default.createElement("tr", null, /* @__PURE__ */ import_react5.default.createElement("td", { colSpan: 14, className: "small muted" }, "No orders match these filters."))))), /* @__PURE__ */ import_react5.default.createElement(Pagination, { page: safePage, totalPages, onChange: setPage }), /* @__PURE__ */ import_react5.default.createElement(
+    )), /* @__PURE__ */ import_react5.default.createElement("select", { className: "select", value: serviceFilter, onChange: resetTo(setServiceFilter) }, /* @__PURE__ */ import_react5.default.createElement("option", { value: "all" }, "All services"), services.map((service) => /* @__PURE__ */ import_react5.default.createElement("option", { key: service, value: service }, service))), /* @__PURE__ */ import_react5.default.createElement("select", { className: "select", value: statusFilter, onChange: resetTo(setStatusFilter) }, /* @__PURE__ */ import_react5.default.createElement("option", { value: "all" }, "All statuses"), STATUS_CHOICES.map((status) => /* @__PURE__ */ import_react5.default.createElement("option", { key: status, value: status }, status))))), error ? /* @__PURE__ */ import_react5.default.createElement("div", { className: "warn mt-10" }, error) : null, /* @__PURE__ */ import_react5.default.createElement("div", { className: "table-wrap mt-10" }, /* @__PURE__ */ import_react5.default.createElement("table", { className: "table orders-table" }, /* @__PURE__ */ import_react5.default.createElement("thead", null, /* @__PURE__ */ import_react5.default.createElement("tr", null, /* @__PURE__ */ import_react5.default.createElement("th", null, "Order"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Date"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Customer"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Service"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Details"), /* @__PURE__ */ import_react5.default.createElement("th", { className: "num" }, "Amount"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Payment"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Status"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Rating"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Fare Quote"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Driver"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Refund"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Refund Status"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Support"), /* @__PURE__ */ import_react5.default.createElement("th", null, "Invoice"))), /* @__PURE__ */ import_react5.default.createElement("tbody", null, pageRows.length ? pageRows.map((order) => {
+      var _a;
+      return /* @__PURE__ */ import_react5.default.createElement("tr", { key: `${order.source}-${order.id}` }, /* @__PURE__ */ import_react5.default.createElement("td", { className: "mono", title: order.id }, order.id.slice(0, 14)), /* @__PURE__ */ import_react5.default.createElement("td", null, /* @__PURE__ */ import_react5.default.createElement("div", null, formatDate(order.date)), hasLaterActivity(order) ? /* @__PURE__ */ import_react5.default.createElement("div", { className: "small muted", title: "Last refund or support activity" }, "upd ", formatDate(new Date(order.activityAt).toISOString())) : null), /* @__PURE__ */ import_react5.default.createElement("td", null, /* @__PURE__ */ import_react5.default.createElement("div", { className: "orders-customer" }, order.customer || "\u2014"), order.phone ? /* @__PURE__ */ import_react5.default.createElement("div", { className: "small muted" }, order.phone) : null), /* @__PURE__ */ import_react5.default.createElement("td", null, /* @__PURE__ */ import_react5.default.createElement("span", { className: `chip ${SERVICE_TONE[order.service] || ""}` }, order.service)), /* @__PURE__ */ import_react5.default.createElement("td", { className: "orders-detail", onClick: (event) => event.stopPropagation() }, /* @__PURE__ */ import_react5.default.createElement(
+        "button",
+        {
+          type: "button",
+          className: "btn small ghost orders-detail-btn",
+          title: order.detail || `Details for ${order.id}`,
+          onClick: () => setDetailKey(`${order.source}-${order.id}`)
+        },
+        /* @__PURE__ */ import_react5.default.createElement(FaInfoCircle, null),
+        " Details"
+      )), /* @__PURE__ */ import_react5.default.createElement("td", { className: "num" }, order.amount > 0 ? formatCurrency(order.amount) : "\u2014"), /* @__PURE__ */ import_react5.default.createElement("td", { className: "small" }, order.payment || "\u2014"), /* @__PURE__ */ import_react5.default.createElement("td", { onClick: (event) => event.stopPropagation() }, /* @__PURE__ */ import_react5.default.createElement(
+        "select",
+        {
+          className: `select status-select ${statusClass(order.status)}`,
+          value: order.status,
+          disabled: busyId === order.id,
+          onChange: (event) => changeStatus(order, event.target.value)
+        },
+        STATUS_CHOICES.includes(order.status) ? null : /* @__PURE__ */ import_react5.default.createElement("option", { value: order.status }, order.status),
+        STATUS_CHOICES.map((status) => /* @__PURE__ */ import_react5.default.createElement("option", { key: status, value: status }, status))
+      )), /* @__PURE__ */ import_react5.default.createElement("td", { className: "orders-rating" }, order.rating > 0 ? /* @__PURE__ */ import_react5.default.createElement(
+        "span",
+        {
+          className: `orders-stars ${order.rating <= 2 ? "is-low" : ""}`,
+          title: order.reviewText ? `${order.rating}/5 \u2014 "${order.reviewText}"` : `${order.rating}/5${order.ratedAt ? ` on ${formatDate(order.ratedAt)}` : ""}`
+        },
+        "\u2605".repeat(order.rating),
+        /* @__PURE__ */ import_react5.default.createElement("span", { className: "orders-stars-empty" }, "\u2605".repeat(5 - order.rating)),
+        order.reviewText ? /* @__PURE__ */ import_react5.default.createElement(FaCommentDots, { className: "orders-rating-note" }) : null
+      ) : /* @__PURE__ */ import_react5.default.createElement("span", { className: "small muted" }, "\u2014")), /* @__PURE__ */ import_react5.default.createElement("td", { className: "orders-detail", onClick: (event) => event.stopPropagation() }, order.bookingMode === "quotes" ? /* @__PURE__ */ import_react5.default.createElement(
+        "button",
+        {
+          type: "button",
+          className: `btn small ghost orders-detail-btn ${order.quoteStatus ? "" : "orders-quote-due"}`,
+          title: `Send a fare quote for ${order.id}`,
+          disabled: busyId === order.id,
+          onClick: () => setQuoteKey(`${order.source}-${order.id}`)
+        },
+        /* @__PURE__ */ import_react5.default.createElement(FaRupeeSign, null),
+        order.quoteStatus ? `${formatCurrency(order.quotedFare)} ${order.quoteStatus}` : "Send quote"
+      ) : /* @__PURE__ */ import_react5.default.createElement("span", { className: "small muted" }, "\u2014")), /* @__PURE__ */ import_react5.default.createElement("td", { className: "orders-detail", onClick: (event) => event.stopPropagation() }, order.source === SOURCES.CAB ? /* @__PURE__ */ import_react5.default.createElement(
+        "button",
+        {
+          type: "button",
+          className: `btn small ghost orders-detail-btn ${order.assignedDriverId ? "" : "orders-quote-due"}`,
+          title: order.assignedDriverId ? `Change the driver on ${order.id}` : `Assign a driver to ${order.id} and send the details to the customer`,
+          disabled: busyId === order.id || order.cancelled,
+          onClick: () => setDispatchKey(`${order.source}-${order.id}`)
+        },
+        /* @__PURE__ */ import_react5.default.createElement(FaCar, null),
+        order.assignedDriverId ? ((_a = driversById.get(order.assignedDriverId)) == null ? void 0 : _a.name) || "Assigned" : "Assign driver"
+      ) : /* @__PURE__ */ import_react5.default.createElement("span", { className: "small muted" }, "\u2014")), /* @__PURE__ */ import_react5.default.createElement("td", null, /* @__PURE__ */ import_react5.default.createElement("span", { className: `chip ${order.refundRequested ? "refund-yes" : "refund-no"}` }, order.refundRequested ? "Yes" : "No")), /* @__PURE__ */ import_react5.default.createElement("td", { onClick: (event) => event.stopPropagation() }, order.refundStatus ? /* @__PURE__ */ import_react5.default.createElement(
+        "select",
+        {
+          className: `select status-select refund-select ${statusClass(order.refundStatus)}`,
+          value: order.refundStatus,
+          disabled: busyId === order.id,
+          onChange: (event) => changeRefundStatus(order, event.target.value)
+        },
+        REFUND_STATUS_CHOICES.includes(order.refundStatus) ? null : /* @__PURE__ */ import_react5.default.createElement("option", { value: order.refundStatus }, order.refundStatus),
+        REFUND_STATUS_CHOICES.map((status) => /* @__PURE__ */ import_react5.default.createElement("option", { key: status, value: status }, status))
+      ) : /* @__PURE__ */ import_react5.default.createElement("span", { className: "small muted" }, "\u2014")), /* @__PURE__ */ import_react5.default.createElement("td", { className: "orders-detail", onClick: (event) => event.stopPropagation() }, order.queries.length ? /* @__PURE__ */ import_react5.default.createElement(
+        "button",
+        {
+          type: "button",
+          className: "btn small ghost orders-detail-btn",
+          title: `View ${order.queries.length} support message(s) for ${order.id}`,
+          onClick: () => setQueryKey(`${order.source}-${order.id}`)
+        },
+        /* @__PURE__ */ import_react5.default.createElement(FaCommentDots, null),
+        " ",
+        order.queries.length,
+        " message",
+        order.queries.length > 1 ? "s" : ""
+      ) : /* @__PURE__ */ import_react5.default.createElement("span", { className: "small muted" }, "\u2014")), /* @__PURE__ */ import_react5.default.createElement("td", { onClick: (event) => event.stopPropagation() }, /* @__PURE__ */ import_react5.default.createElement("div", { className: "orders-invoice-actions" }, order.cancelled || !INVOICE_TABLE_BY_SOURCE[order.source] ? /* @__PURE__ */ import_react5.default.createElement("span", { className: "small muted" }, "\u2014") : /* @__PURE__ */ import_react5.default.createElement(
+        "button",
+        {
+          type: "button",
+          className: "btn small ghost",
+          title: `View invoice for ${order.id}`,
+          onClick: () => openInvoice(order, false)
+        },
+        /* @__PURE__ */ import_react5.default.createElement(FaFileInvoice, null),
+        " View"
+      ))));
+    }) : /* @__PURE__ */ import_react5.default.createElement("tr", null, /* @__PURE__ */ import_react5.default.createElement("td", { colSpan: 14, className: "small muted" }, "No orders match these filters."))))), /* @__PURE__ */ import_react5.default.createElement(Pagination, { page: safePage, totalPages, onChange: setPage }), /* @__PURE__ */ import_react5.default.createElement(
       OrderDetailModal,
       {
         order: detailOrder,
@@ -34773,7 +34836,60 @@ ${target}`);
         onSubmit: sendQuote,
         onClose: () => setQuoteKey("")
       }
+    ), /* @__PURE__ */ import_react5.default.createElement(
+      AssignDriverModal,
+      {
+        order: dispatchOrder,
+        drivers,
+        busy: busyId === (dispatchOrder == null ? void 0 : dispatchOrder.id),
+        onSubmit: sendDispatch,
+        onClose: () => setDispatchKey("")
+      }
     ));
+  }
+  var MANUAL_DRIVER = "__manual__";
+  function AssignDriverModal({ order, drivers, busy, onSubmit, onClose }) {
+    const [driverId, setDriverId] = (0, import_react5.useState)("");
+    const [manual, setManual] = (0, import_react5.useState)({ name: "", phone: "", vehicleType: "", vehicleNumber: "", model: "" });
+    (0, import_react5.useEffect)(() => {
+      if (!order) return;
+      setDriverId(order.assignedDriverId || "");
+      setManual({ name: "", phone: "", vehicleType: "", vehicleNumber: "", model: "" });
+    }, [order == null ? void 0 : order.id]);
+    if (!order) return null;
+    const raw = order.raw || {};
+    const isManual = driverId === MANUAL_DRIVER;
+    const selected = (drivers || []).find((d) => d.id === driverId) || null;
+    const manualReady = manual.name.trim().length >= 2 && manual.phone.replace(/\D/g, "").length >= 8 && !!manual.vehicleType.trim() && !!manual.vehicleNumber.trim();
+    const canSend = !busy && (isManual ? manualReady : !!driverId);
+    const paid = order.payment === "paid";
+    const setManualField = (field) => (event) => setManual((prev) => ({ ...prev, [field]: event.target.value }));
+    return /* @__PURE__ */ import_react5.default.createElement("div", { className: "modal-backdrop", onClick: onClose }, /* @__PURE__ */ import_react5.default.createElement("div", { className: "modal orders-detail-modal", onClick: (event) => event.stopPropagation() }, /* @__PURE__ */ import_react5.default.createElement("div", { className: "modal-head" }, /* @__PURE__ */ import_react5.default.createElement("div", { className: "orders-modal-title" }, /* @__PURE__ */ import_react5.default.createElement("span", { className: "chip" }, "Assign driver"), /* @__PURE__ */ import_react5.default.createElement("span", { className: "modal-title" }, order.id)), /* @__PURE__ */ import_react5.default.createElement("button", { type: "button", className: "btn small ghost", onClick: onClose, "aria-label": "Close assign driver" }, /* @__PURE__ */ import_react5.default.createElement(FaTimes, null))), /* @__PURE__ */ import_react5.default.createElement("div", { className: "orders-modal-body" }, /* @__PURE__ */ import_react5.default.createElement("div", { className: "orders-modal-summary" }, /* @__PURE__ */ import_react5.default.createElement("div", null, /* @__PURE__ */ import_react5.default.createElement("span", { className: "small muted" }, "Customer"), /* @__PURE__ */ import_react5.default.createElement("div", null, order.customer || "\u2014")), /* @__PURE__ */ import_react5.default.createElement("div", null, /* @__PURE__ */ import_react5.default.createElement("span", { className: "small muted" }, "Phone"), /* @__PURE__ */ import_react5.default.createElement("div", null, order.phone || "\u2014")), /* @__PURE__ */ import_react5.default.createElement("div", null, /* @__PURE__ */ import_react5.default.createElement("span", { className: "small muted" }, "Pickup"), /* @__PURE__ */ import_react5.default.createElement("div", null, safeText2(pick(raw, "pickup_location", "pickupLocation")) || "\u2014")), /* @__PURE__ */ import_react5.default.createElement("div", null, /* @__PURE__ */ import_react5.default.createElement("span", { className: "small muted" }, "Drop"), /* @__PURE__ */ import_react5.default.createElement("div", null, safeText2(pick(raw, "drop_location", "dropLocation")) || "\u2014")), /* @__PURE__ */ import_react5.default.createElement("div", null, /* @__PURE__ */ import_react5.default.createElement("span", { className: "small muted" }, "Fare"), /* @__PURE__ */ import_react5.default.createElement("div", null, order.quotedFare > 0 ? formatCurrency(order.quotedFare) : formatCurrency(order.amount))), /* @__PURE__ */ import_react5.default.createElement("div", null, /* @__PURE__ */ import_react5.default.createElement("span", { className: "small muted" }, "Payment"), /* @__PURE__ */ import_react5.default.createElement("div", null, order.payment || "\u2014"))), !paid ? /* @__PURE__ */ import_react5.default.createElement("div", { className: "small muted" }, "This ride is not marked paid. Dispatch confirms the payment against Razorpay first and is refused if nothing was actually captured.") : null, /* @__PURE__ */ import_react5.default.createElement("div", null, /* @__PURE__ */ import_react5.default.createElement("span", { className: "small muted" }, "Driver"), /* @__PURE__ */ import_react5.default.createElement(
+      "select",
+      {
+        className: "select mt-8",
+        value: driverId,
+        onChange: (event) => setDriverId(event.target.value)
+      },
+      /* @__PURE__ */ import_react5.default.createElement("option", { value: "" }, "Select a driver\u2026"),
+      (drivers || []).map((d) => /* @__PURE__ */ import_react5.default.createElement("option", { key: d.id, value: d.id }, [d.name, d.vehicleNumber, d.vehicleModel || d.vehicleType].filter(Boolean).join(" \xB7 "))),
+      /* @__PURE__ */ import_react5.default.createElement("option", { value: MANUAL_DRIVER }, "+ Enter driver details manually")
+    )), isManual ? /* @__PURE__ */ import_react5.default.createElement(import_react5.default.Fragment, null, /* @__PURE__ */ import_react5.default.createElement("div", { className: "orders-modal-summary" }, /* @__PURE__ */ import_react5.default.createElement("div", null, /* @__PURE__ */ import_react5.default.createElement("span", { className: "small muted" }, "Driver name"), /* @__PURE__ */ import_react5.default.createElement("input", { className: "input mt-8", value: manual.name, onChange: setManualField("name"), placeholder: "e.g. Ramesh Thakur" })), /* @__PURE__ */ import_react5.default.createElement("div", null, /* @__PURE__ */ import_react5.default.createElement("span", { className: "small muted" }, "Phone"), /* @__PURE__ */ import_react5.default.createElement("input", { className: "input mt-8", value: manual.phone, onChange: setManualField("phone"), placeholder: "e.g. +919876543210" })), /* @__PURE__ */ import_react5.default.createElement("div", null, /* @__PURE__ */ import_react5.default.createElement("span", { className: "small muted" }, "Vehicle type"), /* @__PURE__ */ import_react5.default.createElement("input", { className: "input mt-8", value: manual.vehicleType, onChange: setManualField("vehicleType"), placeholder: "e.g. SUV" })), /* @__PURE__ */ import_react5.default.createElement("div", null, /* @__PURE__ */ import_react5.default.createElement("span", { className: "small muted" }, "Vehicle number"), /* @__PURE__ */ import_react5.default.createElement("input", { className: "input mt-8", value: manual.vehicleNumber, onChange: setManualField("vehicleNumber"), placeholder: "e.g. HP-01-1234" })), /* @__PURE__ */ import_react5.default.createElement("div", null, /* @__PURE__ */ import_react5.default.createElement("span", { className: "small muted" }, "Model (optional)"), /* @__PURE__ */ import_react5.default.createElement("input", { className: "input mt-8", value: manual.model, onChange: setManualField("model"), placeholder: "e.g. Ertiga" }))), /* @__PURE__ */ import_react5.default.createElement("div", { className: "small muted" }, "Saved as a driver on file, not as notes on this ride \u2014 the customer app looks driver details up by record, so anything not saved that way cannot be shown. A driver already on file with this phone number is reused rather than duplicated.")) : null, selected ? /* @__PURE__ */ import_react5.default.createElement("div", { className: "small muted" }, [selected.phone, selected.vehicleType, selected.vehicleNumber].filter(Boolean).join(" \xB7 "), " \u2014 these details and the pickup OTP go to the customer.") : null, /* @__PURE__ */ import_react5.default.createElement("div", { className: "flex-gap6" }, /* @__PURE__ */ import_react5.default.createElement("button", { type: "button", className: "btn small", onClick: onClose }, "Cancel"), /* @__PURE__ */ import_react5.default.createElement(
+      "button",
+      {
+        type: "button",
+        className: "btn small primary",
+        disabled: !canSend,
+        onClick: () => onSubmit(order, isManual ? { driver: {
+          name: manual.name.trim(),
+          phone: manual.phone.trim(),
+          vehicleType: manual.vehicleType.trim(),
+          vehicleNumber: manual.vehicleNumber.trim(),
+          model: manual.model.trim()
+        } } : { driverId })
+      },
+      busy ? "Assigning\u2026" : "Assign and notify"
+    )))));
   }
   function SendQuoteModal({ order, busy, onSubmit, onClose }) {
     var _a;
@@ -45765,7 +45881,7 @@ ${target}`);
     ],
     // TABLES.QUERIES joins the existing TABLES.REFUNDS here so the orders table's
     // Support column has something to read — travel now renders that table too.
-    travel: [TABLES3.BOOKINGS, TABLES3.CAB_BOOKINGS, TABLES3.BUS_BOOKINGS, TABLES3.BIKE_BOOKINGS, TABLES3.DRIVER_REG_REQUESTS, TABLES3.DRIVERS, TABLES3.DRIVER_BIDS, TABLES3.RIDE_ASSIGNMENTS, TABLES3.REFUNDS, TABLES3.QUERIES, TABLES3.TOURS, TABLES3.HOTELS, TABLES3.BUSES, TABLES3.CAB_PROVIDERS, TABLES3.TAXI_FARES, TABLES3.REVIEWS],
+    travel: [TABLES3.BOOKINGS, TABLES3.CAB_BOOKINGS, TABLES3.BUS_BOOKINGS, TABLES3.BIKE_BOOKINGS, TABLES3.DRIVER_REG_REQUESTS, TABLES3.DRIVERS, TABLES3.DRIVER_VEHICLES, TABLES3.DRIVER_BIDS, TABLES3.RIDE_ASSIGNMENTS, TABLES3.REFUNDS, TABLES3.QUERIES, TABLES3.TOURS, TABLES3.HOTELS, TABLES3.BUSES, TABLES3.CAB_PROVIDERS, TABLES3.TAXI_FARES, TABLES3.REVIEWS],
     // Refunds and support queries back the Refund / Refund Status / Support
     // columns on the orders table this scope renders. Without them those columns
     // are permanently blank here and a customer's complaint cannot pull its order

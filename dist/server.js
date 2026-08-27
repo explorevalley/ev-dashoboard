@@ -4143,6 +4143,25 @@ async function ensureInvoiceForCompletedTransaction(params) {
   };
 }
 
+// vendor/server/services/realtime.ts
+var import_events = require("events");
+var emitter = new import_events.EventEmitter();
+emitter.setMaxListeners(1e3);
+function channelKey(channel) {
+  return String(channel || "").trim().toLowerCase();
+}
+function publishRealtime(channel, event) {
+  const key = channelKey(channel);
+  if (!key) return;
+  emitter.emit(key, event);
+}
+function subscribeRealtime(channel, onEvent) {
+  const key = channelKey(channel);
+  if (!key) return () => void 0;
+  emitter.on(key, onEvent);
+  return () => emitter.off(key, onEvent);
+}
+
 // vendor/server/middleware/auth.ts
 var import_jsonwebtoken = __toESM(require("jsonwebtoken"));
 
@@ -6831,6 +6850,227 @@ adminRouter.post("/cab-bookings/:id/quote", async (req, res) => {
   } catch (err) {
     const code = safeText5(err?.message) || "CAB_QUOTE_FAILED";
     const status = code === "RIDE_NOT_FOUND" ? 404 : 400;
+    return res.status(status).json({ error: code });
+  }
+});
+async function findRazorpayPaymentForRide(ride) {
+  const keyId = safeText5(process.env.RAZORPAY_KEY_ID);
+  const keySecret = safeText5(process.env.RAZORPAY_KEY_SECRET);
+  if (!keyId || !keySecret) throw new Error("RAZORPAY_NOT_CONFIGURED");
+  const auth = Buffer.from(`${keyId}:${keySecret}`).toString("base64");
+  const headers = { Authorization: `Basic ${auth}` };
+  const rideId = safeText5(ride?.id);
+  const matches = (payment) => safeText5(payment?.status).toLowerCase() === "captured" && safeText5(payment?.notes?.rideId) === rideId;
+  const knownPaymentId = safeText5(ride?.paymentId);
+  if (knownPaymentId) {
+    const r = await fetch(`https://api.razorpay.com/v1/payments/${encodeURIComponent(knownPaymentId)}`, { headers });
+    if (r.ok) {
+      const payment = await r.json();
+      if (matches(payment)) return payment;
+    }
+  }
+  const createdAt = Date.parse(safeText5(ride?.createdAt) || "");
+  const from = Number.isFinite(createdAt) ? Math.floor(createdAt / 1e3) - 60 : void 0;
+  const qs = new URLSearchParams({ count: "100" });
+  if (from !== void 0) qs.set("from", String(from));
+  const list = await fetch(`https://api.razorpay.com/v1/payments?${qs.toString()}`, { headers });
+  if (!list.ok) throw new Error("RAZORPAY_LOOKUP_FAILED");
+  const payload = await list.json();
+  return (Array.isArray(payload?.items) ? payload.items : []).find(matches) || null;
+}
+adminRouter.post("/cab-bookings/:id/dispatch", async (req, res) => {
+  try {
+    const rideId = safeText5(req.params.id);
+    const driverId = safeText5(req.body?.driverId);
+    const manualInput = req.body?.driver;
+    const manualDriver = !driverId && manualInput && typeof manualInput === "object" ? {
+      name: safeText5(manualInput.name),
+      phone: safeText5(manualInput.phone),
+      vehicleType: safeText5(manualInput.vehicleType),
+      vehicleNumber: safeText5(manualInput.vehicleNumber),
+      model: safeText5(manualInput.model)
+    } : null;
+    if (!rideId) return res.status(400).json({ error: "RIDE_ID_REQUIRED" });
+    if (!driverId && !manualDriver) return res.status(400).json({ error: "DRIVER_REQUIRED" });
+    if (manualDriver) {
+      if (manualDriver.name.length < 2) throw new Error("DRIVER_NAME_REQUIRED");
+      if (normalizePhoneDigits(manualDriver.phone).length < 8) throw new Error("DRIVER_PHONE_REQUIRED");
+      if (!manualDriver.vehicleType) throw new Error("VEHICLE_TYPE_REQUIRED");
+      if (!manualDriver.vehicleNumber) throw new Error("VEHICLE_NUMBER_REQUIRED");
+    }
+    const dispatchedBy = safeText5(req?.adminUser?.username || req.header("X-EV-Dashboard") || "admin");
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const snapshot = await readData();
+    const snapshotRide = (Array.isArray(snapshot?.cabBookings) ? snapshot.cabBookings : []).find((x) => safeText5(x?.id) === rideId);
+    if (!snapshotRide) return res.status(404).json({ error: "RIDE_NOT_FOUND" });
+    const snapshotStatus = safeText5(snapshotRide?.status).toLowerCase();
+    if (["cancelled", "completed"].includes(snapshotStatus)) throw new Error("RIDE_NOT_DISPATCHABLE");
+    if (driverId) {
+      const snapshotDriver = (Array.isArray(snapshot?.drivers) ? snapshot.drivers : []).find((x) => safeText5(x?.id) === driverId);
+      if (!snapshotDriver) return res.status(404).json({ error: "DRIVER_NOT_FOUND" });
+      if (safeText5(snapshotDriver.status).toLowerCase() !== "approved" || snapshotDriver.active === false) {
+        throw new Error("DRIVER_NOT_APPROVED");
+      }
+    }
+    const payment = await findRazorpayPaymentForRide(snapshotRide);
+    if (!payment) throw new Error("PAYMENT_NOT_CONFIRMED");
+    const paidAmount = Number(payment?.amount || 0) / 100;
+    const paidAt = Number.isFinite(Number(payment?.created_at)) ? new Date(Number(payment.created_at) * 1e3).toISOString() : now;
+    let out = null;
+    await mutateData((db) => {
+      const anyDb = db;
+      const rides = Array.isArray(anyDb.cabBookings) ? anyDb.cabBookings : [];
+      if (!Array.isArray(anyDb.drivers)) anyDb.drivers = [];
+      if (!Array.isArray(anyDb.driverVehicles)) anyDb.driverVehicles = [];
+      if (!Array.isArray(anyDb.rideAssignments)) anyDb.rideAssignments = [];
+      const drivers = anyDb.drivers;
+      const vehicles = anyDb.driverVehicles;
+      const ride = rides.find((x) => safeText5(x?.id) === rideId);
+      if (!ride) throw new Error("RIDE_NOT_FOUND");
+      const liveStatus = safeText5(ride?.status).toLowerCase();
+      if (["cancelled", "completed"].includes(liveStatus)) throw new Error("RIDE_NOT_DISPATCHABLE");
+      let driver = null;
+      if (driverId) {
+        driver = drivers.find((x) => safeText5(x?.id) === driverId);
+        if (!driver) throw new Error("DRIVER_NOT_FOUND");
+      } else {
+        const phoneKey = normalizePhone2(manualDriver.phone);
+        driver = drivers.find((x) => normalizePhone2(safeText5(x?.phone)) === phoneKey) || null;
+        if (driver) {
+          driver.name = manualDriver.name || safeText5(driver.name);
+          driver.status = "approved";
+          driver.active = true;
+          driver.updatedAt = now;
+        } else {
+          driver = {
+            id: makeId("drv"),
+            registrationRequestId: "",
+            name: manualDriver.name,
+            username: "",
+            phone: phoneKey,
+            email: "",
+            passwordHash: "",
+            status: "approved",
+            rating: 4.5,
+            active: true,
+            createdAt: now,
+            updatedAt: now
+          };
+          drivers.unshift(driver);
+        }
+      }
+      if (safeText5(driver.status).toLowerCase() !== "approved" || driver.active === false) {
+        throw new Error("DRIVER_NOT_APPROVED");
+      }
+      const resolvedDriverId = safeText5(driver.id);
+      let vehicle = vehicles.find((x) => safeText5(x?.driverId) === resolvedDriverId) || null;
+      if (manualDriver) {
+        if (vehicle) {
+          vehicle.vehicleType = manualDriver.vehicleType;
+          vehicle.vehicleNumber = manualDriver.vehicleNumber;
+          if (manualDriver.model) vehicle.model = manualDriver.model;
+        } else {
+          vehicle = {
+            id: makeId("veh"),
+            driverId: resolvedDriverId,
+            vehicleType: manualDriver.vehicleType,
+            vehicleNumber: manualDriver.vehicleNumber,
+            color: "",
+            model: manualDriver.model,
+            seats: 4,
+            createdAt: now
+          };
+          vehicles.unshift(vehicle);
+        }
+      }
+      ride.status = "confirmed";
+      ride.assignedDriverId = resolvedDriverId;
+      ride.paymentStatus = "paid";
+      ride.paymentRequired = false;
+      ride.paymentDueAmount = paidAmount;
+      ride.paymentOrderId = safeText5(payment?.order_id) || safeText5(ride.paymentOrderId);
+      ride.paymentOrderAmount = Number(payment?.amount || 0);
+      ride.paymentCurrency = safeText5(payment?.currency || "INR") || "INR";
+      ride.paymentPaidAt = paidAt;
+      ride.paymentId = safeText5(payment?.id);
+      ride.updatedAt = now;
+      if (safeText5(ride.quoteStatus) === "quoted") ride.quoteStatus = "accepted";
+      if (!safeText5(ride.rideOtp)) {
+        ride.rideOtp = String(Math.floor(1e5 + Math.random() * 9e5));
+        ride.rideOtpIssuedAt = now;
+        ride.rideOtpVerifiedAt = "";
+        ride.rideOtpVerifiedBy = "";
+        ride.rideOtpStatus = "pending";
+      }
+      const existing = anyDb.rideAssignments.find((x) => safeText5(x?.rideRequestId) === rideId);
+      const assignment = {
+        id: existing?.id || makeId("assign"),
+        rideRequestId: rideId,
+        driverId: resolvedDriverId,
+        bidId: safeText5(existing?.bidId || ""),
+        status: "assigned",
+        assignedAt: existing?.assignedAt || now,
+        updatedAt: now
+      };
+      if (existing) Object.assign(existing, assignment);
+      else anyDb.rideAssignments.unshift(assignment);
+      const driverDetails = {
+        name: safeText5(driver?.name),
+        phone: normalizePhone2(driver?.phone),
+        rating: Number(driver?.rating || 4.5),
+        carType: safeText5(vehicle?.vehicleType || ride?.vehicleType),
+        carName: safeText5(vehicle?.model || vehicle?.carName || ""),
+        vehicleNumber: safeText5(vehicle?.vehicleNumber || "")
+      };
+      if (!Array.isArray(anyDb.auditLog)) anyDb.auditLog = [];
+      anyDb.auditLog.push({
+        id: makeId("audit"),
+        at: now,
+        action: "CAB_DRIVER_DISPATCHED",
+        entity: "cab_booking",
+        entityId: rideId,
+        meta: { rideId, driverId: resolvedDriverId, paymentId: safeText5(payment?.id), amount: paidAmount, dispatchedBy }
+      });
+      const ridePhone = normalizePhone2(safeText5(ride?.phone || ""));
+      const rideEmail = normalizeEmail(safeText5(ride?.email || ""));
+      const rideUserId = safeText5(ride?.userId || "");
+      if (!Array.isArray(anyDb.userProfiles)) anyDb.userProfiles = [];
+      const profile = anyDb.userProfiles.find(
+        (u) => !!rideUserId && safeText5(u?.id) === rideUserId || !!ridePhone && normalizePhone2(safeText5(u?.phone || "")) === ridePhone || !!rideEmail && normalizeEmail(safeText5(u?.email || "")) === rideEmail
+      );
+      if (profile) {
+        const vehicleText = [driverDetails.carName || driverDetails.carType, driverDetails.vehicleNumber].filter(Boolean).join(" ");
+        const current = Array.isArray(profile.pushNotifications) ? profile.pushNotifications : [];
+        profile.pushNotifications = [{
+          id: makeId("push"),
+          title: "Your driver is assigned",
+          message: `${driverDetails.name || "Your driver"}${vehicleText ? ` - ${vehicleText}` : ""}${driverDetails.phone ? `, ${driverDetails.phone}` : ""}. Share OTP ${safeText5(ride.rideOtp)} at pickup.`,
+          type: "order_update",
+          createdAt: now,
+          from: dispatchedBy
+        }, ...current].slice(0, 200);
+        profile.updatedAt = now;
+      }
+      out = {
+        rideId,
+        driverId: resolvedDriverId,
+        driverCreated: !driverId,
+        assignmentId: assignment.id,
+        status: ride.status,
+        paymentStatus: "paid",
+        paidAmount,
+        paymentId: safeText5(payment?.id),
+        rideOtp: safeText5(ride.rideOtp),
+        notifiedCustomer: !!profile,
+        driver: driverDetails
+      };
+    }, "admin_cab_dispatch");
+    publishRealtime("drivers:rides", { type: "ride_assigned", at: now, payload: out });
+    publishRealtime(`ride:${rideId}:bids`, { type: "ride_assigned", at: now, payload: out });
+    return res.json({ ok: true, dispatch: out });
+  } catch (err) {
+    const code = safeText5(err?.message) || "CAB_DISPATCH_FAILED";
+    const status = code === "RIDE_NOT_FOUND" || code === "DRIVER_NOT_FOUND" ? 404 : 400;
     return res.status(status).json({ error: code });
   }
 });
@@ -9535,27 +9775,6 @@ var import_fs3 = __toESM(require("fs"));
 var import_path6 = __toESM(require("path"));
 init_src();
 init_jsondb();
-
-// vendor/server/services/realtime.ts
-var import_events = require("events");
-var emitter = new import_events.EventEmitter();
-emitter.setMaxListeners(1e3);
-function channelKey(channel) {
-  return String(channel || "").trim().toLowerCase();
-}
-function publishRealtime(channel, event) {
-  const key = channelKey(channel);
-  if (!key) return;
-  emitter.emit(key, event);
-}
-function subscribeRealtime(channel, onEvent) {
-  const key = channelKey(channel);
-  if (!key) return () => void 0;
-  emitter.on(key, onEvent);
-  return () => emitter.off(key, onEvent);
-}
-
-// vendor/server/routes/driver.ts
 var upload3 = (0, import_multer3.default)({
   storage: import_multer3.default.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 }

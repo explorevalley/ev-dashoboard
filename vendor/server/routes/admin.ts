@@ -12,6 +12,7 @@ import { DatabaseSchema, makeId } from "@explorevalley/shared";
 import { mutateData, readData, writeData } from "../services/jsondb";
 import { applyOperationalRules } from "../services/operationalRules";
 import { ensureInvoiceForCompletedTransaction } from "../services/invoice";
+import { publishRealtime } from "../services/realtime";
 import { getAuthClaims, requireAuth } from "../middleware/auth";
 import { getAdminAllowedEmail, getJwtSecret } from "../services/runtimeConfig";
 import { deriveMenuItemMrp, parseMoney as parseMenuMoney } from "../services/foodPricing";
@@ -3037,6 +3038,319 @@ adminRouter.post("/cab-bookings/:id/quote", async (req, res) => {
   } catch (err: any) {
     const code = safeText(err?.message) || "CAB_QUOTE_FAILED";
     const status = code === "RIDE_NOT_FOUND" ? 404 : 400;
+    return res.status(status).json({ error: code });
+  }
+});
+
+/**
+ * Razorpay lookup for a ride's payment.
+ *
+ * A desk-quoted ride has no driver bid, and the customer-side `payment/verify`
+ * settles only through one - see confirmRidePayment, which throws BID_NOT_FOUND
+ * when no bid matches. Money is therefore captured at Razorpay while the ride
+ * still reads "pending", which is what this looks up: the truth is Razorpay's,
+ * not the row's.
+ *
+ * `create-order` does not persist its order id, so a ride whose verify failed
+ * has nothing to look up by. Razorpay cannot filter by notes, so the fallback
+ * scans payments created since the ride was and matches on notes.rideId.
+ */
+async function findRazorpayPaymentForRide(ride: any) {
+  const keyId = safeText(process.env.RAZORPAY_KEY_ID);
+  const keySecret = safeText(process.env.RAZORPAY_KEY_SECRET);
+  if (!keyId || !keySecret) throw new Error("RAZORPAY_NOT_CONFIGURED");
+  const auth = Buffer.from(`${keyId}:${keySecret}`).toString("base64");
+  const headers = { Authorization: `Basic ${auth}` };
+  const rideId = safeText(ride?.id);
+
+  const matches = (payment: any) =>
+    safeText(payment?.status).toLowerCase() === "captured" &&
+    safeText(payment?.notes?.rideId) === rideId;
+
+  const knownPaymentId = safeText((ride as any)?.paymentId);
+  if (knownPaymentId) {
+    const r = await fetch(`https://api.razorpay.com/v1/payments/${encodeURIComponent(knownPaymentId)}`, { headers });
+    if (r.ok) {
+      const payment = await r.json();
+      if (matches(payment)) return payment;
+    }
+  }
+
+  // Only look at payments that could belong to this ride. `from` is inclusive
+  // and in seconds; a minute of slack covers clock skew between the two systems.
+  const createdAt = Date.parse(safeText((ride as any)?.createdAt) || "");
+  const from = Number.isFinite(createdAt) ? Math.floor(createdAt / 1000) - 60 : undefined;
+  const qs = new URLSearchParams({ count: "100" });
+  if (from !== undefined) qs.set("from", String(from));
+  const list = await fetch(`https://api.razorpay.com/v1/payments?${qs.toString()}`, { headers });
+  if (!list.ok) throw new Error("RAZORPAY_LOOKUP_FAILED");
+  const payload = await list.json();
+  return (Array.isArray(payload?.items) ? payload.items : []).find(matches) || null;
+}
+
+/**
+ * Put a driver on a ride the travel desk priced by hand, and tell the customer.
+ *
+ * The bid flow assigns a driver as a side effect of the customer accepting a
+ * bid; a quoted ride never has one, so nothing ever sets assignedDriverId and
+ * the customer sees a paid ride with no driver. This is the equivalent step for
+ * that flow, driven by the desk instead of by a bid.
+ *
+ * The payment is confirmed against Razorpay rather than taken on trust, so an
+ * operator cannot dispatch a ride that was never actually paid for.
+ */
+adminRouter.post("/cab-bookings/:id/dispatch", async (req, res) => {
+  try {
+    const rideId = safeText(req.params.id);
+    const driverId = safeText(req.body?.driverId);
+    // A driver the desk typed in rather than picked. It becomes a real
+    // ev_drivers row below: the customer app resolves driver details by id out
+    // of the drivers table, so free text on the ride could never be displayed.
+    const manualInput = req.body?.driver;
+    const manualDriver = (!driverId && manualInput && typeof manualInput === "object") ? {
+      name: safeText(manualInput.name),
+      phone: safeText(manualInput.phone),
+      vehicleType: safeText(manualInput.vehicleType),
+      vehicleNumber: safeText(manualInput.vehicleNumber),
+      model: safeText(manualInput.model)
+    } : null;
+
+    if (!rideId) return res.status(400).json({ error: "RIDE_ID_REQUIRED" });
+    if (!driverId && !manualDriver) return res.status(400).json({ error: "DRIVER_REQUIRED" });
+    if (manualDriver) {
+      // Mirrors DriverSchema / DriverVehicleSchema, which reject anything less.
+      // Caught here so the operator gets a named field back instead of a zod
+      // dump from the whole-database parse.
+      if (manualDriver.name.length < 2) throw new Error("DRIVER_NAME_REQUIRED");
+      if (normalizePhoneDigits(manualDriver.phone).length < 8) throw new Error("DRIVER_PHONE_REQUIRED");
+      if (!manualDriver.vehicleType) throw new Error("VEHICLE_TYPE_REQUIRED");
+      if (!manualDriver.vehicleNumber) throw new Error("VEHICLE_NUMBER_REQUIRED");
+    }
+
+    const dispatchedBy = safeText((req as any)?.adminUser?.username || req.header("X-EV-Dashboard") || "admin");
+    const now = new Date().toISOString();
+
+    // Read first so Razorpay is queried outside the mutation: mutateData reads
+    // and rewrites the whole database, and a network call inside it holds that
+    // window open for every other writer.
+    const snapshot = await readData();
+    const snapshotRide = (Array.isArray((snapshot as any)?.cabBookings) ? (snapshot as any).cabBookings : [])
+      .find((x: any) => safeText(x?.id) === rideId);
+    if (!snapshotRide) return res.status(404).json({ error: "RIDE_NOT_FOUND" });
+
+    const snapshotStatus = safeText(snapshotRide?.status).toLowerCase();
+    if (["cancelled", "completed"].includes(snapshotStatus)) throw new Error("RIDE_NOT_DISPATCHABLE");
+
+    // Check the driver before calling Razorpay. Both are re-checked inside the
+    // mutation against a fresh read - this snapshot can be served from cache -
+    // but reaching the payment lookup first would report a mistyped driver as
+    // PAYMENT_NOT_CONFIRMED, which sends the operator after the wrong problem.
+    if (driverId) {
+      const snapshotDriver = (Array.isArray((snapshot as any)?.drivers) ? (snapshot as any).drivers : [])
+        .find((x: any) => safeText(x?.id) === driverId);
+      if (!snapshotDriver) return res.status(404).json({ error: "DRIVER_NOT_FOUND" });
+      if (safeText(snapshotDriver.status).toLowerCase() !== "approved" || snapshotDriver.active === false) {
+        throw new Error("DRIVER_NOT_APPROVED");
+      }
+    }
+
+    const payment = await findRazorpayPaymentForRide(snapshotRide);
+    if (!payment) throw new Error("PAYMENT_NOT_CONFIRMED");
+
+    const paidAmount = Number(payment?.amount || 0) / 100;
+    const paidAt = Number.isFinite(Number(payment?.created_at))
+      ? new Date(Number(payment.created_at) * 1000).toISOString()
+      : now;
+
+    let out: any = null;
+    await mutateData((db) => {
+      const anyDb = db as any;
+      const rides = Array.isArray(anyDb.cabBookings) ? anyDb.cabBookings : [];
+      // Normalised before use rather than defaulted to a throwaway array: a
+      // typed-in driver is appended to these, and appending to a detached copy
+      // would silently drop the new driver on write.
+      if (!Array.isArray(anyDb.drivers)) anyDb.drivers = [];
+      if (!Array.isArray(anyDb.driverVehicles)) anyDb.driverVehicles = [];
+      if (!Array.isArray(anyDb.rideAssignments)) anyDb.rideAssignments = [];
+      const drivers = anyDb.drivers;
+      const vehicles = anyDb.driverVehicles;
+
+      const ride = rides.find((x: any) => safeText(x?.id) === rideId);
+      if (!ride) throw new Error("RIDE_NOT_FOUND");
+      const liveStatus = safeText(ride?.status).toLowerCase();
+      if (["cancelled", "completed"].includes(liveStatus)) throw new Error("RIDE_NOT_DISPATCHABLE");
+
+      let driver: any = null;
+      if (driverId) {
+        driver = drivers.find((x: any) => safeText(x?.id) === driverId);
+        if (!driver) throw new Error("DRIVER_NOT_FOUND");
+      } else {
+        // Reuse the record for this phone if one exists, so dispatching the same
+        // person twice does not leave two driver rows for them - and so the
+        // driver app keeps one identity across rides.
+        const phoneKey = normalizePhone(manualDriver!.phone);
+        driver = drivers.find((x: any) => normalizePhone(safeText(x?.phone)) === phoneKey) || null;
+        if (driver) {
+          driver.name = manualDriver!.name || safeText(driver.name);
+          driver.status = "approved";
+          driver.active = true;
+          driver.updatedAt = now;
+        } else {
+          driver = {
+            id: makeId("drv"),
+            registrationRequestId: "",
+            name: manualDriver!.name,
+            username: "",
+            phone: phoneKey,
+            email: "",
+            passwordHash: "",
+            status: "approved",
+            rating: 4.5,
+            active: true,
+            createdAt: now,
+            updatedAt: now
+          };
+          drivers.unshift(driver);
+        }
+      }
+      if (safeText(driver.status).toLowerCase() !== "approved" || driver.active === false) {
+        throw new Error("DRIVER_NOT_APPROVED");
+      }
+      const resolvedDriverId = safeText(driver.id);
+
+      let vehicle = vehicles.find((x: any) => safeText(x?.driverId) === resolvedDriverId) || null;
+      if (manualDriver) {
+        if (vehicle) {
+          vehicle.vehicleType = manualDriver.vehicleType;
+          vehicle.vehicleNumber = manualDriver.vehicleNumber;
+          if (manualDriver.model) vehicle.model = manualDriver.model;
+        } else {
+          vehicle = {
+            id: makeId("veh"),
+            driverId: resolvedDriverId,
+            vehicleType: manualDriver.vehicleType,
+            vehicleNumber: manualDriver.vehicleNumber,
+            color: "",
+            model: manualDriver.model,
+            seats: 4,
+            createdAt: now
+          };
+          vehicles.unshift(vehicle);
+        }
+      }
+
+      // Settle the payment the customer already made. The amount comes from
+      // Razorpay, not from quotedFare, so a re-quote after payment cannot make
+      // the ride claim more was collected than actually was.
+      ride.status = "confirmed";
+      (ride as any).assignedDriverId = resolvedDriverId;
+      (ride as any).paymentStatus = "paid";
+      (ride as any).paymentRequired = false;
+      (ride as any).paymentDueAmount = paidAmount;
+      (ride as any).paymentOrderId = safeText(payment?.order_id) || safeText((ride as any).paymentOrderId);
+      (ride as any).paymentOrderAmount = Number(payment?.amount || 0);
+      (ride as any).paymentCurrency = safeText(payment?.currency || "INR") || "INR";
+      (ride as any).paymentPaidAt = paidAt;
+      (ride as any).paymentId = safeText(payment?.id);
+      (ride as any).updatedAt = now;
+      if (safeText((ride as any).quoteStatus) === "quoted") (ride as any).quoteStatus = "accepted";
+
+      // Handover OTP, matching the bid flow's ensureRideOtp: issued once, and
+      // left alone if the ride already carries one.
+      if (!safeText((ride as any).rideOtp)) {
+        (ride as any).rideOtp = String(Math.floor(100000 + Math.random() * 900000));
+        (ride as any).rideOtpIssuedAt = now;
+        (ride as any).rideOtpVerifiedAt = "";
+        (ride as any).rideOtpVerifiedBy = "";
+        (ride as any).rideOtpStatus = "pending";
+      }
+
+      // The driver app lists its trips from rideAssignments, not from the ride's
+      // assignedDriverId, so without this row the driver never sees the job.
+      // bidId stays empty - there is no bid, and the schema defaults it to "".
+      const existing = anyDb.rideAssignments.find((x: any) => safeText(x?.rideRequestId) === rideId);
+      const assignment = {
+        id: existing?.id || makeId("assign"),
+        rideRequestId: rideId,
+        driverId: resolvedDriverId,
+        bidId: safeText(existing?.bidId || ""),
+        status: "assigned",
+        assignedAt: existing?.assignedAt || now,
+        updatedAt: now
+      };
+      if (existing) Object.assign(existing, assignment);
+      else anyDb.rideAssignments.unshift(assignment);
+
+      const driverDetails = {
+        name: safeText(driver?.name),
+        phone: normalizePhone(driver?.phone),
+        rating: Number(driver?.rating || 4.5),
+        carType: safeText(vehicle?.vehicleType || (ride as any)?.vehicleType),
+        carName: safeText(vehicle?.model || (vehicle as any)?.carName || ""),
+        vehicleNumber: safeText(vehicle?.vehicleNumber || "")
+      };
+
+      if (!Array.isArray(anyDb.auditLog)) anyDb.auditLog = [];
+      anyDb.auditLog.push({
+        id: makeId("audit"),
+        at: now,
+        action: "CAB_DRIVER_DISPATCHED",
+        entity: "cab_booking",
+        entityId: rideId,
+        meta: { rideId, driverId: resolvedDriverId, paymentId: safeText(payment?.id), amount: paidAmount, dispatchedBy }
+      });
+
+      // The customer's copy of the driver details. The app already renders them
+      // from the ride details endpoint once the ride is paid; this is what makes
+      // the phone buzz instead of them having to go and look.
+      const ridePhone = normalizePhone(safeText((ride as any)?.phone || ""));
+      const rideEmail = normalizeEmail(safeText((ride as any)?.email || ""));
+      const rideUserId = safeText((ride as any)?.userId || "");
+      if (!Array.isArray(anyDb.userProfiles)) anyDb.userProfiles = [];
+      const profile = (anyDb.userProfiles as any[]).find((u: any) =>
+        (!!rideUserId && safeText(u?.id) === rideUserId) ||
+        (!!ridePhone && normalizePhone(safeText(u?.phone || "")) === ridePhone) ||
+        (!!rideEmail && normalizeEmail(safeText(u?.email || "")) === rideEmail)
+      );
+      if (profile) {
+        const vehicleText = [driverDetails.carName || driverDetails.carType, driverDetails.vehicleNumber]
+          .filter(Boolean).join(" ");
+        const current = Array.isArray(profile.pushNotifications) ? profile.pushNotifications : [];
+        profile.pushNotifications = [{
+          id: makeId("push"),
+          title: "Your driver is assigned",
+          message: `${driverDetails.name || "Your driver"}${vehicleText ? ` - ${vehicleText}` : ""}`
+            + `${driverDetails.phone ? `, ${driverDetails.phone}` : ""}.`
+            + ` Share OTP ${safeText((ride as any).rideOtp)} at pickup.`,
+          type: "order_update",
+          createdAt: now,
+          from: dispatchedBy
+        }, ...current].slice(0, 200);
+        profile.updatedAt = now;
+      }
+
+      out = {
+        rideId,
+        driverId: resolvedDriverId,
+        driverCreated: !driverId,
+        assignmentId: assignment.id,
+        status: ride.status,
+        paymentStatus: "paid",
+        paidAmount,
+        paymentId: safeText(payment?.id),
+        rideOtp: safeText((ride as any).rideOtp),
+        notifiedCustomer: !!profile,
+        driver: driverDetails
+      };
+    }, "admin_cab_dispatch");
+
+    publishRealtime("drivers:rides", { type: "ride_assigned", at: now, payload: out });
+    publishRealtime(`ride:${rideId}:bids`, { type: "ride_assigned", at: now, payload: out });
+
+    return res.json({ ok: true, dispatch: out });
+  } catch (err: any) {
+    const code = safeText(err?.message) || "CAB_DISPATCH_FAILED";
+    const status = code === "RIDE_NOT_FOUND" || code === "DRIVER_NOT_FOUND" ? 404 : 400;
     return res.status(status).json({ error: code });
   }
 });

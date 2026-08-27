@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { FaCommentDots, FaDownload, FaFileInvoice, FaInfoCircle, FaLayerGroup, FaRupeeSign, FaSearch, FaTimes } from "react-icons/fa";
+import { FaCar, FaCommentDots, FaDownload, FaFileInvoice, FaInfoCircle, FaLayerGroup, FaRupeeSign, FaSearch, FaTimes } from "react-icons/fa";
 import { http, Pagination } from "./LegacyComponents";
 import { withDashboardScope } from "./dashboardUrl";
 
@@ -492,6 +492,11 @@ function buildOrders(tablesByName) {
       bookingMode: normalizeStatus(pick(row, "booking_mode", "bookingMode")) || "union",
       quotedFare: safeNumber(pick(row, "quoted_fare", "quotedFare")),
       quoteStatus: normalizeStatus(pick(row, "quote_status", "quoteStatus")),
+      // Set only once a driver is actually on the ride. A quoted ride never
+      // gets one on its own: the bid flow assigns a driver as a side effect
+      // of the customer accepting a bid, and a desk-priced ride has no bid.
+      assignedDriverId: safeText(pick(row, "assigned_driver_id", "assignedDriverId")),
+      rideOtp: safeText(pick(row, "ride_otp", "rideOtp")),
       refunds,
       queries,
       rating: safeNumber(review?.rating),
@@ -758,8 +763,38 @@ export default function CustomerOrdersTable({ tablesByName, onUpsert, onPatch, o
   const [detailKey, setDetailKey] = useState("");
   const [queryKey, setQueryKey] = useState("");
   const [quoteKey, setQuoteKey] = useState("");
+  const [dispatchKey, setDispatchKey] = useState("");
 
   const orders = useMemo(() => buildOrders(tablesByName), [tablesByName]);
+
+  // Approved, active drivers only: the dispatch endpoint rejects anything
+  // else, so offering them here would just produce a failed dispatch.
+  const drivers = useMemo(() => {
+    const rows = readTableRows(tablesByName, ["drivers", "ev_drivers"]);
+    const vehicles = readTableRows(tablesByName, ["driverVehicles", "ev_driver_vehicles"]);
+    const vehicleByDriver = new Map();
+    vehicles.forEach((v) => {
+      const key = safeText(pick(v, "driver_id", "driverId"));
+      if (key && !vehicleByDriver.has(key)) vehicleByDriver.set(key, v);
+    });
+    return rows
+      .filter((d) => normalizeStatus(d?.status) === "approved" && d?.active !== false)
+      .map((d) => {
+        const vehicle = vehicleByDriver.get(safeText(d?.id)) || null;
+        return {
+          id: safeText(d?.id),
+          name: safeText(d?.name),
+          phone: safeText(d?.phone),
+          rating: safeNumber(d?.rating),
+          vehicleType: safeText(pick(vehicle || {}, "vehicle_type", "vehicleType")),
+          vehicleModel: safeText(vehicle?.model),
+          vehicleNumber: safeText(pick(vehicle || {}, "vehicle_number", "vehicleNumber"))
+        };
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [tablesByName]);
+
+  const driversById = useMemo(() => new Map(drivers.map((d) => [d.id, d])), [drivers]);
 
   const services = useMemo(
     () => Array.from(new Set(orders.map((order) => order.service))).sort(),
@@ -800,6 +835,11 @@ export default function CustomerOrdersTable({ tablesByName, onUpsert, onPatch, o
     [orders, quoteKey]
   );
 
+  const dispatchOrder = useMemo(
+    () => (dispatchKey ? orders.find((order) => `${order.source}-${order.id}` === dispatchKey) || null : null),
+    [orders, dispatchKey]
+  );
+
   const sendQuote = async (order, fare) => {
     if (!order?.id) return;
     setBusyId(order.id);
@@ -810,6 +850,26 @@ export default function CustomerOrdersTable({ tablesByName, onUpsert, onPatch, o
         body: JSON.stringify({ fare })
       });
       setQuoteKey("");
+      await onReload();
+    } catch (err) {
+      setError(String(err?.message || err));
+    } finally {
+      setBusyId("");
+    }
+  };
+
+  // `payload` is either { driverId } for a driver already on file, or
+  // { driver: {...} } for one the operator typed in.
+  const sendDispatch = async (order, payload) => {
+    if (!order?.id || !payload) return;
+    setBusyId(order.id);
+    setError("");
+    try {
+      await http(`/api/admin/cab-bookings/${encodeURIComponent(order.id)}/dispatch`, {
+        method: "POST",
+        body: JSON.stringify(payload)
+      });
+      setDispatchKey("");
       await onReload();
     } catch (err) {
       setError(String(err?.message || err));
@@ -935,6 +995,7 @@ export default function CustomerOrdersTable({ tablesByName, onUpsert, onPatch, o
               <th>Status</th>
               <th>Rating</th>
               <th>Fare Quote</th>
+              <th>Driver</th>
               <th>Refund</th>
               <th>Refund Status</th>
               <th>Support</th>
@@ -1027,6 +1088,27 @@ export default function CustomerOrdersTable({ tablesByName, onUpsert, onPatch, o
                       {order.quoteStatus
                         ? `${formatCurrency(order.quotedFare)} ${order.quoteStatus}`
                         : "Send quote"}
+                    </button>
+                  ) : <span className="small muted">—</span>}
+                </td>
+                {/* Taxi only. A ride priced from the rate card gets its driver
+                    through the bid flow; a desk-quoted one has no bid, so
+                    nothing assigns a driver unless the desk does it here. */}
+                <td className="orders-detail" onClick={(event) => event.stopPropagation()}>
+                  {order.source === SOURCES.CAB ? (
+                    <button
+                      type="button"
+                      className={`btn small ghost orders-detail-btn ${order.assignedDriverId ? "" : "orders-quote-due"}`}
+                      title={order.assignedDriverId
+                        ? `Change the driver on ${order.id}`
+                        : `Assign a driver to ${order.id} and send the details to the customer`}
+                      disabled={busyId === order.id || order.cancelled}
+                      onClick={() => setDispatchKey(`${order.source}-${order.id}`)}
+                    >
+                      <FaCar />
+                      {order.assignedDriverId
+                        ? (driversById.get(order.assignedDriverId)?.name || "Assigned")
+                        : "Assign driver"}
                     </button>
                   ) : <span className="small muted">—</span>}
                 </td>
@@ -1125,6 +1207,164 @@ export default function CustomerOrdersTable({ tablesByName, onUpsert, onPatch, o
         onSubmit={sendQuote}
         onClose={() => setQuoteKey("")}
       />
+
+      <AssignDriverModal
+        order={dispatchOrder}
+        drivers={drivers}
+        busy={busyId === dispatchOrder?.id}
+        onSubmit={sendDispatch}
+        onClose={() => setDispatchKey("")}
+      />
+    </div>
+  );
+}
+
+/**
+ * Put a driver on a taxi ride and send the details to the customer.
+ *
+ * The bid flow never needs this: accepting a bid assigns that bidder. A ride the
+ * travel desk priced by hand has no bid to accept, so the driver is chosen here
+ * instead, and the same step settles the payment the customer already made.
+ *
+ * The payment is confirmed against Razorpay by the endpoint, not by this dialog
+ * — the warning below is a courtesy, not the check.
+ */
+const MANUAL_DRIVER = "__manual__";
+
+function AssignDriverModal({ order, drivers, busy, onSubmit, onClose }) {
+  const [driverId, setDriverId] = useState("");
+  const [manual, setManual] = useState({ name: "", phone: "", vehicleType: "", vehicleNumber: "", model: "" });
+
+  useEffect(() => {
+    if (!order) return;
+    setDriverId(order.assignedDriverId || "");
+    setManual({ name: "", phone: "", vehicleType: "", vehicleNumber: "", model: "" });
+  }, [order?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  if (!order) return null;
+  const raw = order.raw || {};
+  const isManual = driverId === MANUAL_DRIVER;
+  const selected = (drivers || []).find((d) => d.id === driverId) || null;
+  // Matches what the endpoint enforces, which in turn matches DriverSchema and
+  // DriverVehicleSchema. Checked here only so the button is not offered for an
+  // entry the server is going to refuse.
+  const manualReady = manual.name.trim().length >= 2
+    && manual.phone.replace(/\D/g, "").length >= 8
+    && !!manual.vehicleType.trim()
+    && !!manual.vehicleNumber.trim();
+  const canSend = !busy && (isManual ? manualReady : !!driverId);
+  const paid = order.payment === "paid";
+  const setManualField = (field) => (event) =>
+    setManual((prev) => ({ ...prev, [field]: event.target.value }));
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal orders-detail-modal" onClick={(event) => event.stopPropagation()}>
+        <div className="modal-head">
+          <div className="orders-modal-title">
+            <span className="chip">Assign driver</span>
+            <span className="modal-title">{order.id}</span>
+          </div>
+          <button type="button" className="btn small ghost" onClick={onClose} aria-label="Close assign driver">
+            <FaTimes />
+          </button>
+        </div>
+
+        <div className="orders-modal-body">
+          <div className="orders-modal-summary">
+            <div><span className="small muted">Customer</span><div>{order.customer || "\u2014"}</div></div>
+            <div><span className="small muted">Phone</span><div>{order.phone || "\u2014"}</div></div>
+            <div><span className="small muted">Pickup</span><div>{safeText(pick(raw, "pickup_location", "pickupLocation")) || "\u2014"}</div></div>
+            <div><span className="small muted">Drop</span><div>{safeText(pick(raw, "drop_location", "dropLocation")) || "\u2014"}</div></div>
+            <div><span className="small muted">Fare</span><div>{order.quotedFare > 0 ? formatCurrency(order.quotedFare) : formatCurrency(order.amount)}</div></div>
+            <div><span className="small muted">Payment</span><div>{order.payment || "\u2014"}</div></div>
+          </div>
+
+          {!paid ? (
+            <div className="small muted">
+              This ride is not marked paid. Dispatch confirms the payment against
+              Razorpay first and is refused if nothing was actually captured.
+            </div>
+          ) : null}
+
+          <div>
+            <span className="small muted">Driver</span>
+            <select
+              className="select mt-8"
+              value={driverId}
+              onChange={(event) => setDriverId(event.target.value)}
+            >
+              <option value="">Select a driver…</option>
+              {(drivers || []).map((d) => (
+                <option key={d.id} value={d.id}>
+                  {[d.name, d.vehicleNumber, d.vehicleModel || d.vehicleType].filter(Boolean).join(" · ")}
+                </option>
+              ))}
+              <option value={MANUAL_DRIVER}>+ Enter driver details manually</option>
+            </select>
+          </div>
+
+          {isManual ? (
+            <>
+              <div className="orders-modal-summary">
+                <div>
+                  <span className="small muted">Driver name</span>
+                  <input className="input mt-8" value={manual.name} onChange={setManualField("name")} placeholder="e.g. Ramesh Thakur" />
+                </div>
+                <div>
+                  <span className="small muted">Phone</span>
+                  <input className="input mt-8" value={manual.phone} onChange={setManualField("phone")} placeholder="e.g. +919876543210" />
+                </div>
+                <div>
+                  <span className="small muted">Vehicle type</span>
+                  <input className="input mt-8" value={manual.vehicleType} onChange={setManualField("vehicleType")} placeholder="e.g. SUV" />
+                </div>
+                <div>
+                  <span className="small muted">Vehicle number</span>
+                  <input className="input mt-8" value={manual.vehicleNumber} onChange={setManualField("vehicleNumber")} placeholder="e.g. HP-01-1234" />
+                </div>
+                <div>
+                  <span className="small muted">Model (optional)</span>
+                  <input className="input mt-8" value={manual.model} onChange={setManualField("model")} placeholder="e.g. Ertiga" />
+                </div>
+              </div>
+              <div className="small muted">
+                Saved as a driver on file, not as notes on this ride — the customer
+                app looks driver details up by record, so anything not saved that way
+                cannot be shown. A driver already on file with this phone number is
+                reused rather than duplicated.
+              </div>
+            </>
+          ) : null}
+
+          {selected ? (
+            <div className="small muted">
+              {[selected.phone, selected.vehicleType, selected.vehicleNumber].filter(Boolean).join(" · ")}
+              {" — these details and the pickup OTP go to the customer."}
+            </div>
+          ) : null}
+
+          <div className="flex-gap6">
+            <button type="button" className="btn small" onClick={onClose}>Cancel</button>
+            <button
+              type="button"
+              className="btn small primary"
+              disabled={!canSend}
+              onClick={() => onSubmit(order, isManual
+                ? { driver: {
+                    name: manual.name.trim(),
+                    phone: manual.phone.trim(),
+                    vehicleType: manual.vehicleType.trim(),
+                    vehicleNumber: manual.vehicleNumber.trim(),
+                    model: manual.model.trim()
+                  } }
+                : { driverId })}
+            >
+              {busy ? "Assigning\u2026" : "Assign and notify"}
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
